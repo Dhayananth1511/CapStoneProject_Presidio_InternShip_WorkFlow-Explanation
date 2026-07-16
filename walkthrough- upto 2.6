@@ -1,0 +1,208 @@
+# Architecture Walkthrough: The Cognitive Travel Agent Swarm
+
+This document explains the **design principles**, **cognitive patterns**, and **step-by-step execution logic** of the Travel Planner AI backend. It serves as a comprehensive reference guide to understand why the stack was built this way and how data flows through the system.
+
+---
+
+## 1. Core Principle: Shared State (Blackboard Pattern)
+In traditional LLM chains (e.g., LangChain Sequential Chains), Agent A passes its output to Agent B, which passes its output to Agent C. 
+* **The Problem**: If Agent C needs a piece of information from Agent A, it must be passed through B. This creates fragile pipelines, tightly coupled agents, and makes parallel execution impossible.
+* **Our Solution**: We use the **Blackboard Architecture**. There is a single, typed coordinates payload called the `TripContext` (defined in `plannerAgent.ts`). 
+  * Every agent reads only the parts of `TripContext` it cares about.
+  * Every agent writes its findings back into its designated slice of the `TripContext`.
+  * The **Coordinator Agent** acts as the blackboard supervisor, initiating states and passing context snapshots to workers.
+
+```
+                  ┌──────────────────────┐
+                  │     TripContext      │
+                  │ (Single Shared State)│
+                  └──────────┬───────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            ▼                ▼                ▼
+     WeatherAgent     TransportAgent    AccomAgent
+    (Reads input ➔    (Reads input ➔   (Reads input ➔
+    Writes weather)  Writes transport) Writes accom)
+```
+
+---
+
+## 2. Dynamic Slot-Filling (Stages 0A & 0B)
+When a traveler interacts with a chatbot, they don't provide all variables at once. They might say, *"I want to go to Shimla next week."*
+
+### Step 1: Planner Agent (Slot Extraction)
+* **Model**: Llama-3-8b via Groq (chosen for sub-50ms token latency).
+* **Temperature**: `0.1` (almost completely deterministic, preventing creative guesses of dates or names).
+* **Role**: Acts as a **slot extractor**. It maps the user's chat input onto a structured JSON schema. Unprovided fields are returned as `""` or `0`.
+* **State Merge**: It merges new extractions with previous ones, preserving existing data (e.g., if the destination was extracted in Turn 1, it isn't erased in Turn 2 when the user specifies their budget).
+
+### Step 2: Missing Info Agent (Workflow Guard)
+* **Role**: Programmatically reviews the `TripContext`.
+* **Flow**:
+  * If critical slots (`destination`, `start_date`, `end_date`, `budget_inr`, `travelers`) are missing, it halts execution.
+  * Instead of returning a raw validation error, it passes the missing list to Llama-3-8b (at `0.3` temperature) to generate a warm, human-friendly question (e.g., *"Shimla sounds beautiful! How long are you planning to stay and what is your overall budget limit?"*).
+  * The trip status is saved as `DRAFT` in MongoDB so the user can resume.
+  * If slots are complete, it gives the green light to proceed to Stage 1.
+
+---
+
+## 3. Decoupled Tool Execution via MCP (Stage 1)
+Traditional agent designs imports SDK client libraries directly into agent files. 
+* **The Problem**: If an API provider depreciates its package, or we want to change from Google Maps to Mapbox, we have to rewrite our core agent reasoning logic.
+* **Our Solution**: **Model Context Protocol (MCP)**.
+  We wrapped our API services (OpenMeteo, Google Maps, Amadeus, Calendar SDK) inside separate micro-adapters ("MCP Servers"). The agents do not know *how* to call Google Maps or Amadeus; they call generic MCP Server tools (`weatherMCP.ts`, `mapsMCP.ts`, `transitMCP.ts`). 
+
+### Why the 3 Resiliency Layers?
+Every external call is wrapped in a resilience harness (`retry.ts`):
+1. **Exponential Backoff**: Retries failed network calls with an increasing delay (e.g., 1s, 2s, 4s).
+2. **Jitter**: Introduces random milliseconds to prevent "thundering herd" bottlenecks on API servers.
+3. **Timeout Safeguard**: If an external API hangs, it terminates the request at 8 seconds rather than keeping the server socket occupied.
+
+---
+
+## 4. Multi-Tier Redis Caching Strategy
+Calling Google Maps, Amadeus, and weather APIs on every conversational message degrades response speed and consumes API quotas. We implemented specific Time-To-Live (TTL) constraints in Redis based on data volatility:
+
+| Cache Key Namespace | TTL (Seconds) | Rationale |
+|:---|:---|:---|
+| `weather:[dest]:[dates]` | **6 Hours** (21,600s) | Weather predictions change slowly during the day. |
+| `transport:[orig]:[dest]:[date]` | **12 Hours** (43,200s) | Transit timetables and flight offerings are highly stable within a single day. |
+| `hotels:[dest]:[dates]:[travelers]` | **1 Hour** (3,600s) | Lodging rooms and rates fluctuate quickly due to real-time booking updates. |
+| `activities:[dest]:[interests]:[days]` | **24 Hours** (86,400s) | Museums, amusement parks, and dining spots are highly static. |
+
+If Redis suffers an outage, the system emits a warning and falls back to live API calls, ensuring the user experience remains uninterrupted.
+
+---
+
+## 5. Parallel Execution (The Coordinator Agent)
+When slot gathering is complete, we must fetch weather, hotels, local transit routes, and long-distance flights.
+* **The Block**: If we fetch these sequentially, the user has to wait:
+  $$\text{Wait} = 1.5s(\text{Weather}) + 2.0s(\text{Transport}) + 2.5s(\text{Hotels}) + 2.0s(\text{Activities}) = 8.0s$$
+* **The Solution**: The **Coordinator Agent** dispatches all 4 agents concurrently using `Promise.allSettled()`:
+  $$\text{Wait} = \max(1.5, 2.0, 2.5, 2.0) = 2.5s$$
+* `allSettled()` ensures that if one agent fails (e.g., Amadeus API key expires), the application logs the error but proceeds with hotel, weather, and activity suggestions, achieving graceful degradation.
+
+---
+
+## 6. Sequential Planning & Synthesis (Stage 2)
+Once all parameters are gathered, we execute sequential processing:
+
+### Step 1: Budget Agent
+* **Role**: Evaluates the cost properties.
+* **Why**: LLMs are notoriously poor at math. The Budget Agent calculates costs programmatically.
+* **Threshold Warning**: If the estimated expenses exceed the traveler's cap, it flags it, and generates 3 budget alternatives that are returned to the user without wasting tokens on planning an impossible itinerary.
+
+### Step 2: Itinerary Agent
+* **Model**: Llama-3-70b via Groq (highest reasoning model for complex scheduling).
+* **Role**: Weaves together check-in/out schedules, trip timings, weather constraints, and budget limits into a chronological day-by-day JSON schedule.
+
+### Step 3: Synthesis (Coordinator Agent)
+* **Role**: Compiles the final plan into an interactive Markdown page containing formatting, icons, tables, and safety suggestions. The status in MongoDB updates to `PLANNED`.
+
+---
+
+## 7. Human-in-the-Loop (HITL) Lifecycle
+Once the plan is generated, it awaits the user's decision, making it safe and interactive.
+
+```
+                              ┌─────────────────┐
+                              │  Status: PLANNED│
+                              └────────┬────────┘
+                                       │
+                         [Traveler Reviews Itinerary]
+                                       │
+                     ┌─────────────────┴─────────────────┐
+                     ▼                                   ▼
+                [ Approved? ]                       [ Rejected? ]
+                     │                                   │
+             Runs BookingAgent                  Runs ReplanningAgent
+                     │                 (Clears ONLY modified structures)
+                     │                                   │
+           Status: CONFIRMED                             │
+         (Pushes Google Cal events)               Reruns Coordinator
+                     │                                   │
+              [End Workflow]                       Status: PLANNED
+```
+
+### Flow A: Approval & Booking
+1. User calls `/api/trips/:tripId/approve`.
+2. The **Booking Agent** runs:
+   - Registers simulated tickets.
+   - Triggers the `calendarMCP` using the user's OAuth tokens to insert the trip events directly into their **Google Calendar**.
+3. Status updates to `CONFIRMED`.
+
+### Flow B: Rejection & Replanning
+1. User requests changes (e.g. *"Change accommodation to under 1500 per night"*).
+2. The **Replanning Agent** analyzes feedback:
+   - Uses LLM to identify *only* what needs to change.
+   - Clears `accommodation` and `budget` from the `TripContext` but keeps `weather` and `transport` intact.
+3. Reruns the Coordinator Agent. Because cache and preserved variables are loaded, the new plan compiles in seconds.
+
+---
+
+## 8. End-to-End Execution Trace
+Here is the step-by-step lifecycle of a single traveler request:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Traveler as Traveler
+    participant FE as React Client
+    participant Express as Express (index.ts)
+    participant Auth as Auth Middleware
+    participant PlannerSvc as Planner Service
+    participant Swarm as Swarm Agents (Stage 1 & 2)
+    participant Redis as Redis Cache
+    participant DB as MongoDB Atlas
+
+    Traveler->>FE: Enters "Trip to Ooty for 4 days"
+    FE->>Express: POST /api/trips/plan { message }
+    Express->>Auth: Validates JWT access token
+    Auth-->>Express: JWT Verified (userId attached)
+    Express->>PlannerSvc: planTrip(message, userId)
+    
+    critical Stage 0A: Slot Extraction
+        PlannerSvc->>Swarm: PlannerAgent (Identify limits)
+        Swarm-->>PlannerSvc: Context updated { dest: "Ooty" }
+    end
+
+    critical Stage 0B: Missing Info Check
+        PlannerSvc->>Swarm: MissingInfoAgent (Validate parameters)
+        Note over Swarm: missing: budget, dates, travelers
+        Swarm-->>PlannerSvc: { complete: false, question: "How many travelers, dates, and budget?" }
+        PlannerSvc->>DB: Saves partial Trip (Status: DRAFT)
+        PlannerSvc-->>FE: NEEDS_INFO with question
+        FE-->>Traveler: Renders conversation bubble
+    end
+
+    Traveler->>FE: Replies "2 travelers, 15th-18th Oct, budget 30k"
+    FE->>Express: POST /api/trips/plan { message, tripId }
+    Express->>PlannerSvc: Runs planTrip(message, userId, tripId)
+    PlannerSvc->>DB: Loads existing DRAFT context
+    PlannerSvc->>Swarm: PlannerAgent (Extracts replies)
+    PlannerSvc->>Swarm: MissingInfoAgent (Re-checks slots)
+    Swarm-->>PlannerSvc: { complete: true }
+
+    critical Stage 1: Parallel Data Retrieval
+        PlannerSvc->>Redis: Check cache flags (weather, transport, hotels)
+        Redis-->>PlannerSvc: Cache Misses
+        Note over PlannerSvc: Fires weather, transport, hotels, and activities concurrent agents
+        PlannerSvc->>Swarm: CoordinatorAgent.runParallelAgents()
+        Note over Swarm: Fetches real weather (OpenMeteo), transport (Amadeus), hotels (Google Places)
+        Swarm-->>PlannerSvc: Merges results into context
+        PlannerSvc->>Redis: Caches results (with custom TTL configurations)
+    end
+
+    critical Stage 2: Sequential Planning
+        PlannerSvc->>Swarm: BudgetAgent.runBudgetAgent()
+        Swarm-->>PlannerSvc: Cost calculations & buffer check (Feasible: True)
+        PlannerSvc->>Swarm: ItineraryAgent.runItineraryAgent()
+        Swarm-->>PlannerSvc: Chronological JSON schedule
+        PlannerSvc->>Swarm: CoordinatorAgent.synthesizeTripPlan() (Markdown summary)
+        Swarm-->>PlannerSvc: Synthesized Markdown Plan
+    end
+
+    PlannerSvc->>DB: Saves completed Trip (Status: PLANNED)
+    PlannerSvc-->>FE: Return Plan Payload
+    FE-->>Traveler: Renders Trip Summary & Schedule Grid
+```
